@@ -47,14 +47,14 @@ def samples_to_images_tensor(sample, approximation=None, model=None):
     if approximation == 2:
         x_sample = sd_vae_approx.cheap_approximation(sample)
     elif approximation == 1:
-        x_sample = sd_vae_approx.model()(sample.to(devices.device, devices.dtype)).detach()
+        x_sample = sd_vae_approx.model()(sample.to(devices.device, devices.dtype))
     elif approximation == 3:
-        x_sample = sd_vae_taesd.decoder_model()(sample.to(devices.device, devices.dtype)).detach()
+        x_sample = sd_vae_taesd.decoder_model()(sample.to(devices.device, devices.dtype))
         x_sample = x_sample * 2 - 1
     else:
         if model is None:
             model = shared.sd_model
-        with devices.without_autocast(): # fixes an issue with unstable VAEs that are flaky even in fp32
+        with torch.no_grad():
             x_sample = model.decode_first_stage(sample.to(model.first_stage_model.dtype))
 
     return x_sample
@@ -117,7 +117,10 @@ def store_latent(decoded):
 
     if opts.live_previews_enable and opts.show_progress_every_n_steps > 0 and shared.state.sampling_step % opts.show_progress_every_n_steps == 0:
         if not shared.parallel_processing_allowed:
-            shared.state.assign_current_image(sample_to_image(decoded))
+            try:
+                shared.state.assign_current_image(sample_to_image(decoded))
+            except Exception as e:
+                print(f"Error in store_latent: {e}")
 
 
 def is_sampler_using_eta_noise_seed_delta(p):
@@ -158,36 +161,28 @@ replace_torchsde_browinan()
 def apply_refiner(cfg_denoiser, sigma=None):
     if opts.refiner_switch_by_sample_steps or sigma is None:
         completed_ratio = cfg_denoiser.step / cfg_denoiser.total_steps
-        cfg_denoiser.p.extra_generation_params["Refiner switch by sampling steps"] = True
-
     else:
-        # torch.max(sigma) only to handle rare case where we might have different sigmas in the same batch
-        try:
-            timestep = torch.argmin(torch.abs(cfg_denoiser.inner_model.sigmas - torch.max(sigma)))
-        except AttributeError:  # for samplers that don't use sigmas (DDIM) sigma is actually the timestep
-            timestep = torch.max(sigma).to(dtype=int)
+        sigmas = cfg_denoiser.inner_model.sigmas.to(sigma.device)
+        timestep = torch.argmin(torch.abs(sigmas - sigma.max()))
         completed_ratio = (999 - timestep) / 1000
+
+    cfg_denoiser.p.extra_generation_params["Refiner switch by sampling steps"] = opts.refiner_switch_by_sample_steps
 
     refiner_switch_at = cfg_denoiser.p.refiner_switch_at
     refiner_checkpoint_info = cfg_denoiser.p.refiner_checkpoint_info
 
-    if refiner_switch_at is not None and completed_ratio < refiner_switch_at:
-        return False
-
-    if refiner_checkpoint_info is None or shared.sd_model.sd_checkpoint_info == refiner_checkpoint_info:
+    if refiner_switch_at is None or completed_ratio < refiner_switch_at or refiner_checkpoint_info is None or shared.sd_model.sd_checkpoint_info == refiner_checkpoint_info:
         return False
 
     if getattr(cfg_denoiser.p, "enable_hr", False):
         is_second_pass = cfg_denoiser.p.is_hr_pass
+        hires_fix_refiner_pass = opts.hires_fix_refiner_pass
 
-        if opts.hires_fix_refiner_pass == "first pass" and is_second_pass:
+        if (hires_fix_refiner_pass == "first pass" and is_second_pass) or (hires_fix_refiner_pass == "second pass" and not is_second_pass):
             return False
 
-        if opts.hires_fix_refiner_pass == "second pass" and not is_second_pass:
-            return False
-
-        if opts.hires_fix_refiner_pass != "second pass":
-            cfg_denoiser.p.extra_generation_params['Hires refiner'] = opts.hires_fix_refiner_pass
+        if hires_fix_refiner_pass != "second pass":
+            cfg_denoiser.p.extra_generation_params['Hires refiner'] = hires_fix_refiner_pass
 
     cfg_denoiser.p.extra_generation_params['Refiner'] = refiner_checkpoint_info.short_title
     cfg_denoiser.p.extra_generation_params['Refiner switch at'] = refiner_switch_at
@@ -246,7 +241,7 @@ class Sampler:
         self.eta_infotext_field = 'Eta'
         self.eta_default = 1.0
 
-        self.conditioning_key = shared.sd_model.model.conditioning_key
+        self.conditioning_key = getattr(shared.sd_model.model, 'conditioning_key', 'crossattn')
 
         self.p = None
         self.model_wrap_cfg = None
