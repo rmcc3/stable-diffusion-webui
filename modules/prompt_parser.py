@@ -447,25 +447,6 @@ def parse_prompt_attention(text):
     return res
 
 
-common_prompts = {
-    "a photo of a cat": [("a photo of a cat", 1.0)],
-    "a photo of a dog": [("a photo of a dog", 1.0)],
-    "a photo of a bird": [("a photo of a bird", 1.0)],
-    "a photo of a flower": [("a photo of a flower", 1.0)],
-    "a photo of a sunset": [("a photo of a sunset", 1.0)],
-    "a photo of a car": [("a photo of a car", 1.0)],
-    "a photo of a house": [("a photo of a house", 1.0)],
-    "a photo of a person": [("a photo of a person", 1.0)],
-    "a photo of a mountain": [("a photo of a mountain", 1.0)],
-    "a photo of a beach": [("a photo of a beach", 1.0)],
-    "a photo of a city": [("a photo of a city", 1.0)],
-    "a photo of a forest": [("a photo of a forest", 1.0)],
-    "a photo of a lake": [("a photo of a lake", 1.0)],
-    "a photo of a river": [("a photo of a river", 1.0)],
-    "a photo of a bridge": [("a photo of a bridge", 1.0)],
-    "beautiful landscape": [("beautiful landscape", 1.0)],
-}
-
 if __name__ == "__main__":
     import doctest
     doctest.testmod(optionflags=doctest.NORMALIZE_WHITESPACE)
