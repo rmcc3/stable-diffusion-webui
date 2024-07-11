@@ -1,7 +1,8 @@
 import torch
 import inspect
+from typing import Any, Dict, Optional
 import k_diffusion.sampling
-from modules import sd_samplers_common, sd_samplers_extra, sd_samplers_cfg_denoiser, sd_schedulers
+from modules import sd_samplers_common, sd_samplers_extra, sd_samplers_cfg_denoiser, sd_schedulers, devices
 from modules.sd_samplers_cfg_denoiser import CFGDenoiser  # noqa: F401
 from modules.script_callbacks import ExtraNoiseParams, extra_noise_callback
 
@@ -53,21 +54,23 @@ class CFGDenoiserKDiffusion(sd_samplers_cfg_denoiser.CFGDenoiser):
     @property
     def inner_model(self):
         if self.model_wrap is None:
-            denoiser = k_diffusion.external.CompVisVDenoiser if shared.sd_model.parameterization == "v" else k_diffusion.external.CompVisDenoiser
-            self.model_wrap = denoiser(shared.sd_model, quantize=shared.opts.enable_quantization)
+            denoiser_constructor = getattr(shared.sd_model, 'create_denoiser', None)
+
+            if denoiser_constructor is not None:
+                self.model_wrap = denoiser_constructor()
+            else:
+                denoiser = k_diffusion.external.CompVisVDenoiser if shared.sd_model.parameterization == "v" else k_diffusion.external.CompVisDenoiser
+                self.model_wrap = denoiser(shared.sd_model, quantize=shared.opts.enable_quantization)
 
         return self.model_wrap
 
 
 class KDiffusionSampler(sd_samplers_common.Sampler):
-    def __init__(self, funcname, sd_model, options=None):
+    def __init__(self, funcname: str, sd_model: Any, options: Optional[Dict[str, Any]] = None):
         super().__init__(funcname)
-
         self.extra_params = sampler_extra_params.get(funcname, [])
-
         self.options = options or {}
         self.func = funcname if callable(funcname) else getattr(k_diffusion.sampling, self.funcname)
-
         self.model_wrap_cfg = CFGDenoiserKDiffusion(self)
         self.model_wrap = self.model_wrap_cfg.inner_model
 
@@ -115,12 +118,12 @@ class KDiffusionSampler(sd_samplers_common.Sampler):
             if scheduler.need_inner_model:
                 sigmas_kwargs['inner_model'] = self.model_wrap
 
-            sigmas = scheduler.function(n=steps, **sigmas_kwargs, device=shared.device)
+            sigmas = scheduler.function(n=steps, **sigmas_kwargs, device=devices.cpu)
 
         if discard_next_to_last_sigma:
             sigmas = torch.cat([sigmas[:-2], sigmas[-1:]])
 
-        return sigmas
+        return sigmas.cpu()
 
     def sample_img2img(self, p, x, noise, conditioning, unconditional_conditioning, steps=None, image_conditioning=None):
         steps, t_enc = sd_samplers_common.setup_img2img_steps(p, steps)
@@ -128,7 +131,10 @@ class KDiffusionSampler(sd_samplers_common.Sampler):
         sigmas = self.get_sigmas(p, steps)
         sigma_sched = sigmas[steps - t_enc - 1:]
 
-        xi = x + noise * sigma_sched[0]
+        if hasattr(shared.sd_model, 'add_noise_to_latent'):
+            xi = shared.sd_model.add_noise_to_latent(x, noise, sigma_sched[0])
+        else:
+            xi = x + noise * sigma_sched[0]
 
         if opts.img2img_extra_noise > 0:
             p.extra_generation_params["Extra noise"] = opts.img2img_extra_noise
@@ -175,50 +181,44 @@ class KDiffusionSampler(sd_samplers_common.Sampler):
 
         return samples
 
-    def sample(self, p, x, conditioning, unconditional_conditioning, steps=None, image_conditioning=None):
-        steps = steps or p.steps
+    def sample(self, p: Any, x: torch.Tensor, conditioning: Any, unconditional_conditioning: Any,
+               steps: Optional[int] = None, image_conditioning: Optional[Any] = None) -> torch.Tensor:
+        try:
+            steps = steps or p.steps
+            sigmas = self.get_sigmas(p, steps)
 
-        sigmas = self.get_sigmas(p, steps)
+            x = x * sigmas[0] if not opts.sgm_noise_multiplier else x * torch.sqrt(1.0 + sigmas[0] ** 2.0)
 
-        if opts.sgm_noise_multiplier:
-            p.extra_generation_params["SGM noise multiplier"] = True
-            x = x * torch.sqrt(1.0 + sigmas[0] ** 2.0)
-        else:
-            x = x * sigmas[0]
+            extra_params_kwargs = self.initialize(p)
+            parameters = inspect.signature(self.func).parameters
 
-        extra_params_kwargs = self.initialize(p)
-        parameters = inspect.signature(self.func).parameters
+            if 'n' in parameters:
+                extra_params_kwargs['n'] = steps
+            if 'sigma_min' in parameters:
+                extra_params_kwargs['sigma_min'] = self.model_wrap.sigmas[0].item()
+                extra_params_kwargs['sigma_max'] = self.model_wrap.sigmas[-1].item()
+            if 'sigmas' in parameters:
+                extra_params_kwargs['sigmas'] = sigmas
 
-        if 'n' in parameters:
-            extra_params_kwargs['n'] = steps
+            if self.config.options.get('brownian_noise', False):
+                extra_params_kwargs['noise_sampler'] = self.create_noise_sampler(x, sigmas, p)
 
-        if 'sigma_min' in parameters:
-            extra_params_kwargs['sigma_min'] = self.model_wrap.sigmas[0].item()
-            extra_params_kwargs['sigma_max'] = self.model_wrap.sigmas[-1].item()
+            self.last_latent = x
+            self.sampler_extra_args = {
+                'cond': conditioning,
+                'image_cond': image_conditioning,
+                'uncond': unconditional_conditioning,
+                'cond_scale': p.cfg_scale,
+                's_min_uncond': self.s_min_uncond
+            }
 
-        if 'sigmas' in parameters:
-            extra_params_kwargs['sigmas'] = sigmas
+            samples = self.launch_sampling(steps, lambda: self.func(
+                self.model_wrap_cfg, x, extra_args=self.sampler_extra_args,
+                disable=False, callback=self.callback_state, **extra_params_kwargs
+            ))
 
-        if self.config.options.get('brownian_noise', False):
-            noise_sampler = self.create_noise_sampler(x, sigmas, p)
-            extra_params_kwargs['noise_sampler'] = noise_sampler
-
-        if self.config.options.get('solver_type', None) == 'heun':
-            extra_params_kwargs['solver_type'] = 'heun'
-
-        self.last_latent = x
-        self.sampler_extra_args = {
-            'cond': conditioning,
-            'image_cond': image_conditioning,
-            'uncond': unconditional_conditioning,
-            'cond_scale': p.cfg_scale,
-            's_min_uncond': self.s_min_uncond
-        }
-
-        samples = self.launch_sampling(steps, lambda: self.func(self.model_wrap_cfg, x, extra_args=self.sampler_extra_args, disable=False, callback=self.callback_state, **extra_params_kwargs))
-
-        self.add_infotext(p)
-
-        return samples
-
-
+            self.add_infotext(p)
+            return samples
+        except Exception as e:
+            print(f"Error in KDiffusionSampler.sample: {str(e)}")
+            raise
