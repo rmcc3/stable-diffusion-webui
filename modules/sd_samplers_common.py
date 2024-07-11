@@ -2,6 +2,7 @@ import inspect
 from collections import namedtuple
 import numpy as np
 import torch
+from typing import List, Optional, Tuple, Union, Dict, Any
 from PIL import Image
 from modules import devices, images, sd_vae_approx, sd_samplers, sd_vae_taesd, shared, sd_models
 from modules.shared import opts, state
@@ -34,9 +35,8 @@ def setup_img2img_steps(p, steps=None):
 approximation_indexes = {"Full": 0, "Approx NN": 1, "Approx cheap": 2, "TAESD": 3}
 
 
-def samples_to_images_tensor(sample, approximation=None, model=None):
+def samples_to_images_tensor(sample: torch.Tensor, approximation: Optional[int] = None, model: Optional[Any] = None) -> torch.Tensor:
     """Transforms 4-channel latent space images into 3-channel RGB image tensors, with values in range [-1, 1]."""
-
     if approximation is None or (shared.state.interrupted and opts.live_preview_fast_interrupt):
         approximation = approximation_indexes.get(opts.show_progress_type, 0)
 
@@ -60,13 +60,11 @@ def samples_to_images_tensor(sample, approximation=None, model=None):
     return x_sample
 
 
-def single_sample_to_image(sample, approximation=None):
-    x_sample = samples_to_images_tensor(sample.unsqueeze(0), approximation)[0] * 0.5 + 0.5
-
-    x_sample = torch.clamp(x_sample, min=0.0, max=1.0)
+def single_sample_to_image(sample: torch.Tensor, approximation: Optional[int] = None) -> Image.Image:
+    x_sample = samples_to_images_tensor(sample.unsqueeze(0), approximation)[0]
+    x_sample = torch.clamp((x_sample + 1.0) / 2.0, min=0.0, max=1.0)
     x_sample = 255. * np.moveaxis(x_sample.cpu().numpy(), 0, 2)
     x_sample = x_sample.astype(np.uint8)
-
     return Image.fromarray(x_sample)
 
 
@@ -76,7 +74,7 @@ def decode_first_stage(model, x):
     return samples_to_images_tensor(x, approx_index, model)
 
 
-def sample_to_image(samples, index=0, approximation=None):
+def sample_to_image(samples: torch.Tensor, index: int = 0, approximation: Optional[int] = None) -> Image.Image:
     return single_sample_to_image(samples[index], approximation)
 
 
@@ -112,15 +110,12 @@ def images_tensor_to_samples(image, approximation=None, model=None):
     return x_latent
 
 
-def store_latent(decoded):
+def store_latent(decoded: torch.Tensor) -> None:
     state.current_latent = decoded
 
     if opts.live_previews_enable and opts.show_progress_every_n_steps > 0 and shared.state.sampling_step % opts.show_progress_every_n_steps == 0:
         if not shared.parallel_processing_allowed:
-            try:
-                shared.state.assign_current_image(sample_to_image(decoded))
-            except Exception as e:
-                print(f"Error in store_latent: {e}")
+            shared.state.assign_current_image(sample_to_image(decoded))
 
 
 def is_sampler_using_eta_noise_seed_delta(p):
@@ -225,12 +220,12 @@ class Sampler:
     def __init__(self, funcname):
         self.funcname = funcname
         self.func = funcname
-        self.extra_params = []
-        self.sampler_noises = None
-        self.stop_at = None
-        self.eta = None
-        self.config: SamplerData = None  # set by the function calling the constructor
-        self.last_latent = None
+        self.extra_params: List[str] = []
+        self.sampler_noises: Optional[List[torch.Tensor]] = None
+        self.stop_at: Optional[int] = None
+        self.eta: Optional[float] = None
+        self.config: Optional[SamplerData] = None
+        self.last_latent: Optional[torch.Tensor] = None
         self.s_min_uncond = None
         self.s_churn = 0.0
         self.s_tmin = 0.0
@@ -248,12 +243,10 @@ class Sampler:
         self.sampler_extra_args = None
         self.options = {}
 
-    def callback_state(self, d):
+    def callback_state(self, d: Dict[str, Any]) -> None:
         step = d['i']
-
         if self.stop_at is not None and step > self.stop_at:
             raise InterruptedException
-
         state.sampling_step = step
         shared.total_tqdm.update()
 
