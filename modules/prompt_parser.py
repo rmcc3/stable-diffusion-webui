@@ -3,6 +3,8 @@ from __future__ import annotations
 import re
 from collections import namedtuple
 import lark
+from functools import lru_cache
+from collections import namedtuple
 
 # a prompt like this: "fantasy landscape with a [mountain:lake:0.25] and [an oak:a christmas tree:0.75][ in foreground::0.6][: in background:0.25] [shoddy:masterful:0.5]"
 # will be represented with prompt_schedule like this (assuming steps=100):
@@ -24,6 +26,22 @@ WHITESPACE: /\s+/
 plain: /([^\\\[\]():|]|\\.)+/
 %import common.SIGNED_NUMBER -> NUMBER
 """)
+
+
+# Add a cache for parsed prompts
+@lru_cache(maxsize=1000)
+def cached_parse_prompt_attention(text):
+    """
+    Cached version of parse_prompt_attention
+    """
+    return parse_prompt_attention(text)
+
+
+@lru_cache(maxsize=1000)
+def get_cached_conditioning(model, prompt, steps):
+    """Cache the conditioning for individual prompts."""
+    return model.get_learned_conditioning([prompt])
+
 
 def get_learned_conditioning_prompt_schedules(prompts, base_steps, hires_steps=None, use_old_scheduling=False):
     """
@@ -155,48 +173,26 @@ class SdConditioning(list):
 
 
 def get_learned_conditioning(model, prompts: SdConditioning | list[str], steps, hires_steps=None, use_old_scheduling=False):
-    """converts a list of prompts into a list of prompt schedules - each schedule is a list of ScheduledPromptConditioning, specifying the comdition (cond),
-    and the sampling step at which this condition is to be replaced by the next one.
-
-    Input:
-    (model, ['a red crown', 'a [blue:green:5] jeweled crown'], 20)
-
-    Output:
-    [
-        [
-            ScheduledPromptConditioning(end_at_step=20, cond=tensor([[-0.3886,  0.0229, -0.0523,  ..., -0.4901, -0.3066,  0.0674], ..., [ 0.3317, -0.5102, -0.4066,  ...,  0.4119, -0.7647, -1.0160]], device='cuda:0'))
-        ],
-        [
-            ScheduledPromptConditioning(end_at_step=5, cond=tensor([[-0.3886,  0.0229, -0.0522,  ..., -0.4901, -0.3067,  0.0673], ..., [-0.0192,  0.3867, -0.4644,  ...,  0.1135, -0.3696, -0.4625]], device='cuda:0')),
-            ScheduledPromptConditioning(end_at_step=20, cond=tensor([[-0.3886,  0.0229, -0.0522,  ..., -0.4901, -0.3067,  0.0673], ..., [-0.7352, -0.4356, -0.7888,  ...,  0.6994, -0.4312, -1.2593]], device='cuda:0'))
-        ]
-    ]
-    """
+    """converts a list of prompts into a list of prompt schedules - each schedule is a list of ScheduledPromptConditioning, specifying the condition (cond),
+    and the sampling step at which this condition is to be replaced by the next one."""
     res = []
 
     prompt_schedules = get_learned_conditioning_prompt_schedules(prompts, steps, hires_steps, use_old_scheduling)
-    cache = {}
 
     for prompt, prompt_schedule in zip(prompts, prompt_schedules):
-
-        cached = cache.get(prompt, None)
-        if cached is not None:
-            res.append(cached)
-            continue
-
-        texts = SdConditioning([x[1] for x in prompt_schedule], copy_from=prompts)
-        conds = model.get_learned_conditioning(texts)
-
         cond_schedule = []
-        for i, (end_at_step, _) in enumerate(prompt_schedule):
-            if isinstance(conds, dict):
-                cond = {k: v[i] for k, v in conds.items()}
+
+        for end_at_step, subprompt in prompt_schedule:
+            # Use cached conditioning for each subprompt
+            cond = get_cached_conditioning(model, subprompt, steps)
+
+            if isinstance(cond, dict):
+                cond = {k: v[0] for k, v in cond.items()}  # Take first item if it's a dict
             else:
-                cond = conds[i]
+                cond = cond[0]  # Take first item if it's a tensor
 
             cond_schedule.append(ScheduledPromptConditioning(end_at_step, cond))
 
-        cache[prompt] = cond_schedule
         res.append(cond_schedule)
 
     return res
@@ -268,7 +264,7 @@ def get_multicond_learned_conditioning(model, prompts, steps, hires_steps=None, 
 
 
 class DictWithShape(dict):
-    def __init__(self, x, shape):
+    def __init__(self, x, shape=None):
         super().__init__()
         self.update(x)
 
@@ -414,28 +410,21 @@ def parse_prompt_attention(text):
         for p in range(start_position, len(res)):
             res[p][1] *= multiplier
 
-    for m in re_attention.finditer(text):
-        text = m.group(0)
-        weight = m.group(1)
+    for match in re_attention.finditer(text):
+        text = match.group(0)
+        weight = match.group(1)
 
         if text.startswith('\\'):
             res.append([text[1:], 1.0])
-        elif text == '(':
-            round_brackets.append(len(res))
-        elif text == '[':
-            square_brackets.append(len(res))
+        elif text in '([':
+            (round_brackets if text == '(' else square_brackets).append(len(res))
         elif weight is not None and round_brackets:
             multiply_range(round_brackets.pop(), float(weight))
-        elif text == ')' and round_brackets:
-            multiply_range(round_brackets.pop(), round_bracket_multiplier)
-        elif text == ']' and square_brackets:
-            multiply_range(square_brackets.pop(), square_bracket_multiplier)
+        elif text in ')]' and (round_brackets or square_brackets):
+            multiply_range((round_brackets if text == ')' else square_brackets).pop(),
+                           round_bracket_multiplier if text == ')' else square_bracket_multiplier)
         else:
-            parts = re.split(re_break, text)
-            for i, part in enumerate(parts):
-                if i > 0:
-                    res.append(["BREAK", -1])
-                res.append([part, 1.0])
+            res.extend([part, 1.0] for part in re_break.split(text) if part)
 
     for pos in round_brackets:
         multiply_range(pos, round_bracket_multiplier)
@@ -456,6 +445,26 @@ def parse_prompt_attention(text):
             i += 1
 
     return res
+
+
+common_prompts = {
+    "a photo of a cat": [("a photo of a cat", 1.0)],
+    "a photo of a dog": [("a photo of a dog", 1.0)],
+    "a photo of a bird": [("a photo of a bird", 1.0)],
+    "a photo of a flower": [("a photo of a flower", 1.0)],
+    "a photo of a sunset": [("a photo of a sunset", 1.0)],
+    "a photo of a car": [("a photo of a car", 1.0)],
+    "a photo of a house": [("a photo of a house", 1.0)],
+    "a photo of a person": [("a photo of a person", 1.0)],
+    "a photo of a mountain": [("a photo of a mountain", 1.0)],
+    "a photo of a beach": [("a photo of a beach", 1.0)],
+    "a photo of a city": [("a photo of a city", 1.0)],
+    "a photo of a forest": [("a photo of a forest", 1.0)],
+    "a photo of a lake": [("a photo of a lake", 1.0)],
+    "a photo of a river": [("a photo of a river", 1.0)],
+    "a photo of a bridge": [("a photo of a bridge", 1.0)],
+    "beautiful landscape": [("beautiful landscape", 1.0)],
+}
 
 if __name__ == "__main__":
     import doctest
