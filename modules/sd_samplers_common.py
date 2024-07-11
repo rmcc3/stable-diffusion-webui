@@ -157,9 +157,13 @@ def apply_refiner(cfg_denoiser, sigma=None):
     if opts.refiner_switch_by_sample_steps or sigma is None:
         completed_ratio = cfg_denoiser.step / cfg_denoiser.total_steps
     else:
-        sigmas = cfg_denoiser.inner_model.sigmas.to(sigma.device)
-        timestep = torch.argmin(torch.abs(sigmas - sigma.max()))
-        completed_ratio = (999 - timestep) / 1000
+        if hasattr(cfg_denoiser.inner_model, 'sigmas'):
+            sigmas = cfg_denoiser.inner_model.sigmas.to(sigma.device)
+            timestep = torch.argmin(torch.abs(sigmas - sigma.max()))
+            completed_ratio = (999 - timestep) / 1000
+        else:
+            # If sigmas is not available, fall back to using step ratio
+            completed_ratio = cfg_denoiser.step / cfg_denoiser.total_steps
 
     cfg_denoiser.p.extra_generation_params["Refiner switch by sampling steps"] = opts.refiner_switch_by_sample_steps
 
