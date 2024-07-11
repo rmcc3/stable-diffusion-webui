@@ -2,16 +2,18 @@ import torch
 import tqdm
 import k_diffusion.sampling
 import numpy as np
+from typing import Any, Callable, Dict, Optional
 
 from modules import shared
 from modules.models.diffusion.uni_pc import uni_pc
+from modules.torch_utils import float64
 
 
 @torch.no_grad()
-def ddim(model, x, timesteps, extra_args=None, callback=None, disable=None, eta=0.0):
+def ddim(model: Any, x: torch.Tensor, timesteps: torch.Tensor, extra_args: Optional[Dict[str, Any]] = None, callback: Optional[Callable] = None, disable: Optional[bool] = None, eta: float = 0.0):
     alphas_cumprod = model.inner_model.inner_model.alphas_cumprod
     alphas = alphas_cumprod[timesteps]
-    alphas_prev = alphas_cumprod[torch.nn.functional.pad(timesteps[:-1], pad=(1, 0))].to(torch.float64 if x.device.type != 'mps' and x.device.type != 'xpu' else torch.float32)
+    alphas_prev = alphas_cumprod[torch.nn.functional.pad(timesteps[:-1], pad=(1, 0))].to(float64(x))
     sqrt_one_minus_alphas = torch.sqrt(1 - alphas)
     sigmas = eta * np.sqrt((1 - alphas_prev.cpu().numpy()) / (1 - alphas.cpu()) * (1 - alphas.cpu() / alphas_prev.cpu().numpy()))
 
@@ -40,10 +42,52 @@ def ddim(model, x, timesteps, extra_args=None, callback=None, disable=None, eta=
 
 
 @torch.no_grad()
-def plms(model, x, timesteps, extra_args=None, callback=None, disable=None):
+def ddim_cfgpp(model: Any, x: torch.Tensor, timesteps: torch.Tensor, extra_args: Optional[Dict[str, Any]] = None, callback: Optional[Callable] = None, disable: Optional[bool] = None, eta: float = 0.0):
+    """ Implements CFG++: Manifold-constrained Classifier Free Guidance For Diffusion Models (2024).
+    Uses the unconditional noise prediction instead of the conditional noise to guide the denoising direction.
+    The CFG scale is divided by 12.5 to map CFG from [0.0, 12.5] to [0, 1.0].
+    """
     alphas_cumprod = model.inner_model.inner_model.alphas_cumprod
     alphas = alphas_cumprod[timesteps]
-    alphas_prev = alphas_cumprod[torch.nn.functional.pad(timesteps[:-1], pad=(1, 0))].to(torch.float64 if x.device.type != 'mps' and x.device.type != 'xpu' else torch.float32)
+    alphas_prev = alphas_cumprod[torch.nn.functional.pad(timesteps[:-1], pad=(1, 0))].to(float64(x))
+    sqrt_one_minus_alphas = torch.sqrt(1 - alphas)
+    sigmas = eta * np.sqrt((1 - alphas_prev.cpu().numpy()) / (1 - alphas.cpu()) * (1 - alphas.cpu() / alphas_prev.cpu().numpy()))
+
+    model.cond_scale_miltiplier = 1 / 12.5
+    model.need_last_noise_uncond = True
+
+    extra_args = {} if extra_args is None else extra_args
+    s_in = x.new_ones((x.shape[0],))
+    s_x = x.new_ones((x.shape[0], 1, 1, 1))
+    for i in tqdm.trange(len(timesteps) - 1, disable=disable):
+        index = len(timesteps) - 1 - i
+
+        e_t = model(x, timesteps[index].item() * s_in, **extra_args)
+
+        # Check if last_noise_uncond exists, if not, use e_t as a fallback
+        last_noise_uncond = getattr(model, 'last_noise_uncond', e_t)
+
+        a_t = alphas[index].item() * s_x
+        a_prev = alphas_prev[index].item() * s_x
+        sigma_t = sigmas[index].item() * s_x
+        sqrt_one_minus_at = sqrt_one_minus_alphas[index].item() * s_x
+
+        pred_x0 = (x - sqrt_one_minus_at * e_t) / a_t.sqrt()
+        dir_xt = (1. - a_prev - sigma_t ** 2).sqrt() * last_noise_uncond
+        noise = sigma_t * k_diffusion.sampling.torch.randn_like(x)
+        x = a_prev.sqrt() * pred_x0 + dir_xt + noise
+
+        if callback is not None:
+            callback({'x': x, 'i': i, 'sigma': 0, 'sigma_hat': 0, 'denoised': pred_x0})
+
+    return x
+
+
+@torch.no_grad()
+def plms(model: Any, x: torch.Tensor, timesteps: torch.Tensor, extra_args: Optional[Dict[str, Any]] = None, callback: Optional[Callable] = None, disable: Optional[bool] = None):
+    alphas_cumprod = model.inner_model.inner_model.alphas_cumprod
+    alphas = alphas_cumprod[timesteps]
+    alphas_prev = alphas_cumprod[torch.nn.functional.pad(timesteps[:-1], pad=(1, 0))].to(float64(x))
     sqrt_one_minus_alphas = torch.sqrt(1 - alphas)
 
     extra_args = {} if extra_args is None else extra_args
@@ -102,11 +146,15 @@ def plms(model, x, timesteps, extra_args=None, callback=None, disable=None):
 
 
 class UniPCCFG(uni_pc.UniPC):
-    def __init__(self, cfg_model, extra_args, callback, *args, **kwargs):
+    def __init__(self, cfg_model: Any, extra_args: Dict[str, Any], callback: Callable, *args, **kwargs):
         super().__init__(None, *args, **kwargs)
+        self.cfg_model = cfg_model
+        self.extra_args = extra_args
+        self.callback = callback
+        self.index = 0
 
-        def after_update(x, model_x):
-            callback({'x': x, 'i': self.index, 'sigma': 0, 'sigma_hat': 0, 'denoised': model_x})
+        def after_update(self, x: torch.Tensor, model_x: torch.Tensor) -> None:
+            self.callback({'x': x, 'i': self.index, 'sigma': 0, 'sigma_hat': 0, 'denoised': model_x})
             self.index += 1
 
         self.cfg_model = cfg_model
@@ -115,23 +163,24 @@ class UniPCCFG(uni_pc.UniPC):
         self.index = 0
         self.after_update = after_update
 
-    def get_model_input_time(self, t_continuous):
+    def get_model_input_time(self, t_continuous: torch.Tensor) -> torch.Tensor:
         return (t_continuous - 1. / self.noise_schedule.total_N) * 1000.
 
-    def model(self, x, t):
+    def model(self, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
         t_input = self.get_model_input_time(t)
-
-        res = self.cfg_model(x, t_input, **self.extra_args)
-
-        return res
+        return self.cfg_model(x, t_input, **self.extra_args)
 
 
-def unipc(model, x, timesteps, extra_args=None, callback=None, disable=None, is_img2img=False):
-    alphas_cumprod = model.inner_model.inner_model.alphas_cumprod
+def unipc(model: Any, x: torch.Tensor, timesteps: torch.Tensor, extra_args: Optional[Dict[str, Any]] = None, callback: Optional[Callable] = None, disable: Optional[bool] = None, is_img2img: bool = False):
+    try:
+        alphas_cumprod = model.inner_model.inner_model.alphas_cumprod
 
-    ns = uni_pc.NoiseScheduleVP('discrete', alphas_cumprod=alphas_cumprod)
-    t_start = timesteps[-1] / 1000 + 1 / 1000 if is_img2img else None  # this is likely off by a bit - if someone wants to fix it please by all means
-    unipc_sampler = UniPCCFG(model, extra_args, callback, ns, predict_x0=True, thresholding=False, variant=shared.opts.uni_pc_variant)
-    x = unipc_sampler.sample(x, steps=len(timesteps), t_start=t_start, skip_type=shared.opts.uni_pc_skip_type, method="multistep", order=shared.opts.uni_pc_order, lower_order_final=shared.opts.uni_pc_lower_order_final)
+        ns = uni_pc.NoiseScheduleVP('discrete', alphas_cumprod=alphas_cumprod)
+        t_start = timesteps[-1] / 1000 + 1 / 1000 if is_img2img else None
+        unipc_sampler = UniPCCFG(model, extra_args, callback, ns, predict_x0=True, thresholding=False, variant=shared.opts.uni_pc_variant)
+        x = unipc_sampler.sample(x, steps=len(timesteps), t_start=t_start, skip_type=shared.opts.uni_pc_skip_type, method="multistep", order=shared.opts.uni_pc_order, lower_order_final=shared.opts.uni_pc_lower_order_final)
 
-    return x
+        return x
+    except Exception as e:
+        print(f"Error in unipc sampling: {str(e)}")
+        raise
