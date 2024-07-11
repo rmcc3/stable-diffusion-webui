@@ -282,11 +282,11 @@ class CFGDenoiser(torch.nn.Module):
         self.sampler.last_latent = self.get_pred_x0(torch.cat([x_in[i:i + 1] for i in denoised_image_indexes]), torch.cat([x_out[i:i + 1] for i in denoised_image_indexes]), sigma)
 
         if opts.live_preview_content == "Prompt":
-            preview = self.sampler.last_latent
+            preview = torch.cat([denoised[i:i+1] for i in denoised_image_indexes])
         elif opts.live_preview_content == "Negative prompt":
             preview = self.get_pred_x0(x_in[-uncond.shape[0]:], x_out[-uncond.shape[0]:], sigma)
         else:
-            preview = self.get_pred_x0(torch.cat([x_in[i:i+1] for i in denoised_image_indexes]), torch.cat([denoised[i:i+1] for i in denoised_image_indexes]), sigma)
+            preview = self.sampler.last_latent
 
         sd_samplers_common.store_latent(preview)
 
@@ -296,4 +296,3 @@ class CFGDenoiser(torch.nn.Module):
 
         self.step += 1
         return denoised
-
